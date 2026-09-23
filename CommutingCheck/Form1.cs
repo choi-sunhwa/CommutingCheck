@@ -1,15 +1,17 @@
-﻿using System;
+﻿using Microsoft.Extensions.Configuration;
+using Microsoft.Web.WebView2.Core;
+using System;
 using System.Diagnostics;
+using System.Linq;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Web.WebView2.Core;
 
 namespace CommutingCheck
 {
     public partial class Form1 : Form
     {
         public static IConfiguration config;
+        public static IConfiguration workScheduleConfig;
 
         public Form1()
         {
@@ -19,6 +21,10 @@ namespace CommutingCheck
                 .AddJsonFile("appsettings.json")
                 .Build();
 
+            workScheduleConfig = new ConfigurationBuilder()
+                .AddJsonFile("workSchedule.json", optional: true)
+                .Build();
+
             this.Load += Form1_Load;
         }
 
@@ -26,17 +32,67 @@ namespace CommutingCheck
         {
             try
             {
+                if (!ShouldRunNow())
+                {
+                    CloseApplication();
+                    return;
+                }
+
                 await InitializeWebViewAsync();
                 await WebLoginAsync();
             }
             catch (Exception ex)
             {
-                MessageBox.Show(
-                    $"자동 로그인 중 오류가 발생했습니다.\r\n\r\n{ex.Message}",
-                    "오류",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Error
-                );
+                WriteLog($"ERROR: {ex.Message}");
+                CloseApplication();
+            }
+        }
+
+        private void WriteLog(string message)
+        {
+            string path = "CommutingCheck.log";
+
+            System.IO.File.AppendAllText(
+                path,
+                $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {message}{Environment.NewLine}"
+            );
+        }
+
+        private bool ShouldRunNow()
+        {
+            DateTime now = DateTime.Now;
+
+            int dayOfWeek = Convert.ToInt32(now.DayOfWeek);
+            int hour = now.Hour;
+
+            // 주말이면 바로 종료
+            if (dayOfWeek < 1 || dayOfWeek > 5)
+                return false;
+
+            string dateKey = now.ToString("yyyy-MM-dd");
+
+            string scheduleType =
+                workScheduleConfig[$"WorkSchedule:{dateKey}"];
+
+            switch (scheduleType)
+            {
+                case "연차":
+                    return false;
+
+                case "오전":
+                    // 오전반차
+                    // 14:50 출근 / 19:01 퇴근
+                    return hour == 14 || hour == 19;
+
+                case "오후":
+                    // 오후반차
+                    // 09:40 출근 / 15:01 퇴근
+                    return hour == 9 || hour == 15;
+
+                default:
+                    // 일반 근무
+                    // 09:40 출근 / 19:01 퇴근
+                    return hour == 9 || hour == 19;
             }
         }
 
@@ -44,6 +100,8 @@ namespace CommutingCheck
         {
             // WebView2 Core 초기화 완료까지 기다림
             await webView2.EnsureCoreWebView2Async();
+
+            webView2.CoreWebView2.NewWindowRequested += CoreWebView2_NewWindowRequested;
 
             string url = config["AccountInfo:url"];
 
@@ -62,11 +120,18 @@ namespace CommutingCheck
                 throw new Exception("로그인 페이지를 불러오지 못했습니다.");
         }
 
+        private void CoreWebView2_NewWindowRequested(
+        object sender,
+        CoreWebView2NewWindowRequestedEventArgs e)
+            {
+                e.Handled = true;
+            }
+
         private async Task WebLoginAsync()
         {
             #region 혹시 몰라서 Edge 닫음
 
-            CloseEdgeProcesses();
+            //CloseEdgeProcesses();
 
             #endregion
 
@@ -113,12 +178,13 @@ namespace CommutingCheck
 
             #region 2차 인증
 
-            bool secondLoginReady = await WaitForScriptConditionAsync(
-                "typeof secondCertLogin === 'function'",
-                timeoutMs: 15000
+            bool secondAuthReady = await WaitForScriptConditionAsync(
+                @"document.getElementById('qrImg1') !== null &&
+                  typeof secondCertLogin === 'function'",
+                timeoutMs: 30000
             );
 
-            if (!secondLoginReady)
+            if (!secondAuthReady)
                 throw new Exception("secondCertLogin 함수를 찾지 못했습니다.");
 
             await webView2.CoreWebView2.ExecuteScriptAsync(
@@ -137,41 +203,30 @@ namespace CommutingCheck
             if (!attendancePageReady)
                 throw new Exception("출퇴근 영역을 불러오지 못했습니다.");
 
-            DateTime now = DateTime.Now;
-            int dayOfWeek = Convert.ToInt32(now.DayOfWeek);
-            int hour = now.Hour;
+            int hour = DateTime.Now.Hour;
+            bool isIn = hour == 9 || hour == 14;
 
-            // 월 ~ 금
-            if (dayOfWeek >= 1 && dayOfWeek <= 5)
+            if (isIn)
             {
-                if (hour == 9 || hour == 19 || hour == 23)
-                {
-                    bool isIn = hour == 9;
-
-                    if (isIn)
-                    {
-                        await ProcessCheckInAsync();
-                    }
-                    else
-                    {
-                        await ProcessCheckOutAsync();
-                    }
-
-                    // 확인 버튼이 생길 때까지 최대 5초 대기
-                    bool confirmReady = await WaitForScriptConditionAsync(
-                        "document.getElementById('btnConfirm') !== null",
-                        timeoutMs: 5000
-                    );
-
-                    if (confirmReady)
-                    {
-                        await webView2.CoreWebView2.ExecuteScriptAsync(
-                            "document.getElementById('btnConfirm').click();"
-                        );
-                    }
-                }
+                await ProcessCheckInAsync();
+            }
+            else
+            {
+                await ProcessCheckOutAsync();
             }
 
+            // 확인 버튼이 생길 때까지 최대 5초 대기
+            bool confirmReady = await WaitForScriptConditionAsync(
+                "document.getElementById('btnConfirm') !== null",
+                timeoutMs: 5000
+            );
+
+            if (confirmReady)
+            {
+                await webView2.CoreWebView2.ExecuteScriptAsync(
+                    "document.getElementById('btnConfirm').click();"
+                );
+            }
             #endregion
 
             // 마지막 JS 처리 후 약간만 기다림
@@ -231,6 +286,13 @@ namespace CommutingCheck
             {
                 try
                 {
+                    if (webView2.CoreWebView2 == null)
+                    {
+                        await Task.Delay(intervalMs);
+                        elapsed += intervalMs;
+                        continue;
+                    }
+
                     string result =
                         await webView2.CoreWebView2.ExecuteScriptAsync(
                             $"Boolean({condition})"
@@ -283,6 +345,10 @@ namespace CommutingCheck
 
         private void CloseApplication()
         {
+            foreach (Form form in Application.OpenForms.Cast<Form>().ToList())
+            {
+                form.Close();
+            }
             Application.Exit();
         }
 
